@@ -1,0 +1,564 @@
+---
+title: "`r params$facility`  \nCT Reject Analysis \n `r substring(params$endDate,1,4)`"
+author: "`r params$author`"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  word_document:
+    reference_docx: "../../style/MIDAShWordReportStyle.docx"
+  pdf_document:
+    latex_engine: xelatex
+    template: ../../style/midasTemplate.tex
+    number_sections: yes
+    pandoc_args: ["--variable", "graphics=yes",
+                "--variable", "natbib=yes",
+                "--variable", "geometry:margin=1in",
+                "--variable", "compact-title:yes"]
+    keep_tex: TRUE
+link-citations: yes
+bibliography: ../../style/references.bib
+params:
+  author: ''
+  authorEmail: ''
+  authorPhone: ''
+  authorArea: ''
+  facility: ''
+  facilityID: ''
+  rspp: Radiation Management Plan
+  startDate: '20240101'
+  endDate: '20241231'
+  pediatric: FALSE
+  localSummary: TRUE
+  minStudyCount: 10
+  
+biblio-style: unsrt
+---
+
+
+```{r setup, echo=FALSE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.pos="H")
+
+library(plotly)
+library(lubridate)
+library(tidyverse)
+library(magrittr)
+library(huxtable)
+
+# Load local settings
+baseDir <- getwd()
+baseDir <- str_sub(baseDir, 1, last(str_locate_all(baseDir, "MIDASh/")[[1]])[[2]])
+source(paste0(baseDir,"config/settingPointers.R"))
+
+
+# pdf report settings
+plotSaveMethod <- "kaleido" # or orca, or html depending on preferences, setup, and desired output. Orca is deprecated
+plotSaveUseServer <- F # TRUE Doesn't necessarily work with orca
+plotSaveOverwrite = T # FALSE is mostly for when developing and only working on non-plot related issues
+
+# Setup kaleido via reticulate
+if (plotSaveMethod=="kaleido"){
+  reticulate::use_condaenv("r-reticulate")
+  #reticulate::conda_install('r-reticulate', 'plotly', channel = 'plotly') # Only required for initial install
+  #reticulate::conda_install('r-reticulate','python-kaleido') # Only required for initial install
+  reticulate::py_run_string("import sys")
+}
+
+colorSet <- list(good="#2ECC40",
+                 ok="#FF851B",
+                 bad="#FF4136")
+
+```
+
+<!-- All data initial data processing should go here -->
+
+```{r date-processing, echo=FALSE, include=FALSE}
+startDate <- ymd(params$startDate)
+
+startDateString <- paste(day(startDate), month(startDate,label = T,abbr = T), year(startDate))
+
+endDate <- ymd(params$endDate)
+endDateString <- paste(day(endDate), month(endDate,label = T,abbr = T), year(endDate))
+```
+
+```{r data-gathering, include=FALSE}
+
+# Load the data
+loadCTCache()
+processCTCachedData()
+```
+
+```{r load-drl-data, include=FALSE}
+mod <- "CT"
+
+mDrl <- drl[[mod]]
+mStudyMap <- studyMap[[mod]]
+
+# List of custom groups to include in analysis
+customDRLCategories <- c("CTPA", "CTCA")
+
+mStudyMap <- mStudyMap %>% filter(
+  (custom_group %in% customDRLCategories) |
+    (custom_group == "Not Applicable") |
+    (is.na(custom_group))
+)
+
+```
+
+<!-- This section might need to be edited to override any errors in your collected data -->
+
+```{r site-specific-processing, include=FALSE}
+#Overwrite institution name, because it is unreliably set at the modalities
+ctQueriedData$institution_name = params$facility
+ctStudyData$institution_name = params$facility
+
+#Set the selection and reference data set
+selectionList <- list("display_name"=c("Scanner 1", "Scanner 2", "Scanner 3", "Scanner 4", "Scanner 5"))
+referenceList <- list("study_description"=c("all")
+                      )
+
+```
+
+
+
+
+```{r collect-ctpa, include=F}
+
+rejectAcqData <- ctQueriedData %>%
+  filterDataToSelectionFilterSet(referenceList=referenceList,selectionList = selectionList) %>%
+  arrange(study_instance_uid, irradiation_event_uid) %>%
+    mutate(
+      single_rotation = abs(nominal_total_collimation_width/scanning_length-1)<0.06,
+      short_scan = nominal_total_collimation_width < 30) %>%
+    mutate(
+      ct_acquisition_type = if_else(single_rotation & short_scan & (ct_acquisition_type %in% c(NA, "Stationary Acquisition", "Sequenced Acquisition")),
+                                     "Monitoring Acquisition",
+                                     ct_acquisition_type)
+    ) %>%
+  mutate(is_monitoring = ct_acquisition_type=="Monitoring Acquisition") %>%
+  group_by(study_instance_uid) %>%
+  mutate(cutoff = ifelse(is_monitoring, row_number(), 999)) %>%
+  mutate(cutoff = min(cutoff, na.rm=T)) %>%
+  mutate(contrast_indication = row_number() > cutoff) %>%
+  ungroup %>%
+  filter(study_description == "CT ANGIOGRAPHY PULMONARY")
+  
+
+
+rejectAcqData %>%
+  sliceMaxDLPPerStudy() %>%
+  select(accession_number, study_instance_uid) %>%
+  openxlsx::write.xlsx("ctpa_accessions_for_pacs_scripts.xlsx")
+
+
+
+
+```
+
+
+
+```{r addForeignVars, include=F}
+
+# CTPA Vars should be basically static unless the protocol names change
+ctpaVars <- openxlsx::read.xlsx("ctpa_varieties.xlsx")
+ctpaVars$acquisition_protocol <- stringr::str_squish(ctpaVars$acquisition_protocol)
+
+# CTPA WEDs should be updated intermittently
+ctpaWeds <- openxlsx::read.xlsx("ctpa_with_wed_20250917.xlsx") %>%
+  select(study_instance_uid, scout_wed) %>%
+  filter(., !duplicated(study_instance_uid)) %>%
+  mutate(wed = scout_wed/10)
+
+
+ctpaInjection <- read_csv("ctpa_injection_data.csv")
+
+
+```
+
+
+
+
+
+```{r reject-processing, include=F}
+
+
+ageBinning <- function(df) {
+  age_bins = c(0, 18, 35, 50, 75, 200)
+  df$age_bin <- cut(df$patient_age_decimal, age_bins)
+  
+  
+  return(df)
+}
+
+sizeBinning <- function(df) {
+  bins = c(0, 20, 25, 27.5, 30, 32.5, 37.5,999)
+  df$size_bin <- cut(df$wed, bins)
+  
+  return(df)
+}
+
+weightBinning <- function(df) {
+  bins = c(0, 25, 50, 75, 100, 125, 150, 175,200,225,250, 999)
+  df$weight_bin <- cut(df$patient_weight_est, bins)
+  
+  return(df)
+}
+
+weightBinningFine <- function(df) {
+  bins = seq(5,400,5)
+  df$weight_bin_fine <- cut(df$patient_weight_est, bins)
+  
+  return(df)
+}
+
+
+rejectAcqData <- rejectAcqData %>%
+  filter(study_date < "2025-09-12")
+
+
+rejectAcqData <- rejectAcqData %>%
+  left_join(ctpaVars,by = "acquisition_protocol") %>%
+  left_join(ctpaWeds, by = "study_instance_uid") %>%
+  filter(!is.na(group_name)) %>%
+  group_by(study_instance_uid) %>%
+  mutate(scout_protocol=acquisition_protocol[[1]]) %>%
+  filter(ct_acquisition_type != "Constant Angle Acquisition") %>%
+  mutate(target_helical=max(target_helical),
+         target_axial=max(target_axial)) %>%
+  mutate(temp_protocol=paste(unique(acquisition_protocol),sep = " / ", collapse = "/ ")) %>%
+  mutate(first_protocol=first(acquisition_protocol)) %>%
+  mutate(last_protocol=last(acquisition_protocol)) %>%
+  ungroup %>%
+  filter(!is_monitoring) %>%
+  getCTAcquisitionTotals() %>%
+  mutate(reject_flag=(helical_count > target_helical) | (axial_count > target_axial)) %>% 
+  ageBinning %>%
+  sizeBinning
+
+
+rejectStudyData <- rejectAcqData %>%
+  sliceMaxDLPPerStudy()
+
+
+rejectStudyData <- rejectStudyData %>% filter(!duplicated(study_instance_uid))
+rejectStudyData <- left_join(rejectStudyData,ctpaInjection) %>%
+  select(-study_instance_uid, -`...1`)
+
+
+rejectStudyData <- rejectStudyData %>%
+  mutate(patient_weight_est = 8.623*exp(0.0079*scout_wed)) %>%
+  weightBinning %>%
+  weightBinningFine
+
+
+
+```
+
+
+```{r, include=F}
+
+model <- glm(rejectStudyData$wed ~ rejectStudyData$contrast_injection.0.contrast)
+summary(model)
+
+```
+
+
+
+# Purpose
+
+This report investigates the reject rate of CT Pulmonary Angiography procedures performed at `r params$facility`.
+
+
+
+# Executive Summary
+
+
+# Results
+
+## Reject rate by weight fine
+
+```{r reject-summary-age, echo=F}
+rejectStudyData %>% group_by(weight_bin_fine) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  tidyTableNames() %>%view
+  as_hux
+                  
+```
+```{r reject-summary-age, echo=F}
+rejectStudyData %>% group_by(weight_bin_fine) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  mutate(weight_bin_)
+  plot_ly() %>% plotly::add_markers(x=~weight_bin_fine, y=~reject_rate)
+                  
+```
+
+## Reject rate by weight
+
+```{r reject-summary-age, echo=F}
+rejectStudyData %>% group_by(weight_bin, patient_sex) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  tidyTableNames() %>%view
+  as_hux
+                  
+```
+
+## Reject rate by age
+
+```{r reject-summary-age, echo=F}
+rejectStudyData %>% group_by(age_bin) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  tidyTableNames() %>%
+  as_hux
+                  
+```
+
+
+
+
+## Reject rate by age and gender
+
+```{r reject-summary-age-gender, echo=F}
+rejectStudyData %>% group_by(age_bin, patient_sex) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  tidyTableNames() %>%
+  as_hux
+           
+
+```
+
+
+## Reject rate by size and gender
+
+```{r reject-summary-size-gender, echo=F}
+rejectStudyData %>% group_by(size_bin, patient_sex) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  tidyTableNames() %>%
+  as_hux
+           
+
+```
+
+
+## Reject rate by age and initial protocol used
+
+```{r reject-summary-protocol, echo=F}
+rejectStudyData %>%
+  group_by(age_bin, first_protocol) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  tidyTableNames() %>%
+  as_hux %>%
+  set_font_size(9)
+                  
+```
+
+
+## Reject rate by CT system
+
+```{r reject-rate-by-system, echo=FALSE}
+rejectStudyData %>%
+  group_by(display_name) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>% 
+  tidyTableNames() %>%
+  as_hux %>%
+  set_font_size(11)
+                  
+```
+
+## Reject rate by technologist
+
+```{r reject-summary-tech, echo=F}
+rejectStudyData %>% group_by(operator_name) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>%
+  filter(total_count > 20) %>%
+  tidyTableNames() %>%
+  as_hux
+                  
+```
+
+
+## Reject rate by size and initial contrast injection
+
+```{r reject-summary-contrast, echo=F}
+rejectStudyData %>% group_by(size_bin, `contrast_injection.0.contrast`) %>%
+  summarise(.groups="keep",
+    reject_count = sum(reject_flag),
+    total_count = n()
+  ) %>%
+  filter(total_count > params$minStudyCount) %>%
+  mutate(reject_rate = round(reject_count/total_count,digits=3)) %>%
+  filter(total_count > params$minStudyCount) %>%
+  tidyTableNames() %>%
+  as_hux
+                  
+```
+
+# Contact
+
+Please contact `r params$authorArea` with any queries.
+
+`r params$authorEmail`
+
+`r params$authorPhone`
+
+\newpage
+
+\appendix
+
+# Method
+
+## Data sources
+
+Facility data was collected automatically from Radiation Dose Structured Reports. These reports contain key dose metrics for all CT studies conducted.
+
+## X-ray systems
+
+Radiation dose data has been obtained for all the systems shown in table 2.
+
+```{r show-device-table, echo=FALSE}
+
+tdfs <- rejectStudyData %>%
+  group_by(display_name) %>%
+  filter(row_number()==1) %>%
+  filter(study_datetime >= startDate) %>%
+  filter(study_datetime <= endDate) %>%
+  select(display_name, institution_name, manufacturer, manufacturer_model_name)
+names(tdfs) <- tdfs %>% names %>% tidyString()
+
+tdfs %>%
+  as_hux %>%
+  theme_basic %>% 
+  set_caption(paste("FL systems included in FRL survey at", params$facility))  %>%
+  set_font_size(9)
+
+```
+
+## Acquisition Protocol details
+
+
+```{r acquisition-protocol-table, echo=FALSE}
+
+ctpaVars %>% 
+  tidyTableNames() %>%
+  as_hux() %>%
+  theme_basic %>%
+  set_caption("CTPA Acquisition Protocol details for acquisitions in the study period") %>%
+  set_font_size(9)
+
+
+```
+
+
+## Data analysis
+
+The following steps are taken:
+
+* Acquisitions are sorted into Scouts, Helicals, Axials (including volumes), and Monitoring.
+* Based on the acquisition protocol, the target number of helical and axial acquisitions is assigned to each group
+* Where multiple acquisition protocols are used for a certain study, the highest value is used.
+* Where any acquisition protocol other than those designated as strictly belonging to CTPA procedures is used, the study is ignored
+* Where the number of helical or axial acquisitions exceeds the target values, the study is considered to involve a reject
+
+
+```{r}
+tt <- rejectStudyData %>% select(reject_flag, wed, size_bin, age_bin, patient_sex, patient_age_decimal, first_protocol, mean_ctdivol, contrast=`contrast_injection.0.contrast`) %>%
+  filter(!is.na(wed)) %>%
+  filter(patient_age_decimal > 18)
+
+
+modelSex <- glm(reject_flag ~ patient_sex, data = tt, family = binomial)
+#summary(modelSex)
+
+modelWed <- glm(reject_flag ~ wed, data = tt, family = binomial)
+#summary(modelWed)
+
+modelAge <- glm(reject_flag ~ patient_age_decimal, data = tt, family = binomial)
+#summary(modelAge)
+
+modelSexWed <- glm(reject_flag ~ wed + patient_sex, data = tt, family = binomial)
+#summary(modelSexWed)
+
+modelAgeWed <- glm(reject_flag ~ patient_age_decimal + wed, data = tt, family = binomial)
+#summary(modelAgeWed)
+
+modelProtocol <- glm(reject_flag ~ first_protocol, data = tt, family = binomial)
+
+modelProtocolWed <- glm(reject_flag ~ first_protocol+wed, data = tt, family = binomial)
+
+modelAgeWedProtocol <- glm(reject_flag ~ first_protocol+wed+patient_age_decimal, data = tt, family = binomial)
+
+modelAgeGenderWed <-  glm(reject_flag ~ patient_sex+wed+patient_age_decimal, data = tt, family = binomial)
+
+modelContrast <- glm(reject_flag ~ contrast, data = tt, family = binomial)
+
+modelSizeGenderContrast <- glm(reject_flag ~ patient_sex+wed+contrast, data = tt, family = binomial)
+
+modelAgeGenderWedContrast <- glm(reject_flag ~ patient_age_decimal+patient_sex+wed+contrast, data = tt, family = binomial)
+
+
+modelCTDI <-  glm(reject_flag ~ mean_ctdivol, data = tt, family = binomial)
+
+
+
+models <- AIC(modelSex, modelWed, modelAge, modelSexWed, modelAgeWed, modelProtocol, modelProtocolWed, modelAgeWedProtocol, modelAgeGenderWed, modelCTDI, modelContrast, modelSizeGenderContrast,modelAgeGenderWedContrast)
+models_df <- as_tibble(models)
+models_df$model <- rownames(models)
+models_df <- models_df %>% select(model, df, AIC)
+models_df %>% as_hux
+
+
+
+
+```
+
+
+
+```{r}
+rejectStudyData %>% openxlsx::write.xlsx("ctpaRepeatData.xlsx")
+```
+
+
+
+# References
