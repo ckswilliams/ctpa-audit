@@ -149,10 +149,13 @@ if __name__ == '__main__':
     data_df = pd.read_csv(INPUT_STUDIES_CSV_FN)
     partial_df = pd.read_csv(INTERMEDIATE_OUTPUT_CSV_FN)
 
-
     processed_uids = set(done_df.study_instance_uid) | set(partial_df.study_instance_uid)
 
-    output_data = []
+    # Pre-populate output_data with partial results not yet in the final output,
+    # so they are preserved in every intermediate write even if the script crashes.
+    carry_over = partial_df.loc[~partial_df.study_instance_uid.isin(set(done_df.study_instance_uid))]
+    output_data = [carry_over] if not carry_over.empty else []
+
     for i in data_df.index:
         row = data_df.loc[i, :]
         if row.study_instance_uid in processed_uids:
@@ -165,13 +168,11 @@ if __name__ == '__main__':
             stacked_output = pd.concat(output_data, axis=0)
             stacked_output.to_csv(INTERMEDIATE_OUTPUT_CSV_FN, index=False)
 
-    # Carry forward any partial results not yet in the processed file,
-    # in case the script previously crashed before the final save.
-    carry_over = partial_df.loc[~partial_df.study_instance_uid.isin(set(done_df.study_instance_uid))]
-
-    stacked_output = pd.concat(output_data, axis=0)
-    stacked_output = stacked_output.sort_values('contrast_injection.0.contrast', na_position='last').drop_duplicates('study_instance_uid')
-
-    completed_df = pd.concat([done_df, carry_over, stacked_output])
+    if output_data:
+        stacked_output = pd.concat(output_data, axis=0)
+        stacked_output = stacked_output.sort_values('contrast_injection.0.contrast', na_position='last').drop_duplicates('study_instance_uid')
+        completed_df = pd.concat([done_df, stacked_output])
+    else:
+        completed_df = done_df
     completed_df.to_csv(PROCESSED_STUDIES_CSV_FN, index=False)
 

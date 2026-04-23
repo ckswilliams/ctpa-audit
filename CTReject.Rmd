@@ -112,7 +112,7 @@ ctStudyData$institution_name = params$facility
 
 #Set the selection and reference data set
 selectionList <- list("display_name"=c("Scanner 1", "Scanner 2", "Scanner 3", "Scanner 4", "Scanner 5"))
-referenceList <- list("study_description"=c("all")
+referenceList <- list("study_description"=c("CT ANGIOGRAPHY PULMONARY")
                       )
 
 ```
@@ -138,15 +138,14 @@ rejectAcqData <- ctQueriedData %>%
   mutate(cutoff = ifelse(is_monitoring, row_number(), 999)) %>%
   mutate(cutoff = min(cutoff, na.rm=T)) %>%
   mutate(contrast_indication = row_number() > cutoff) %>%
-  ungroup %>%
-  filter(study_description == "CT ANGIOGRAPHY PULMONARY")
+  ungroup
   
 
 
 rejectAcqData %>%
   sliceMaxDLPPerStudy() %>%
   select(accession_number, study_instance_uid) %>%
-  openxlsx::write.xlsx("ctpa_accessions_for_pacs_scripts.xlsx")
+  write_csv("ctpa_accessions_for_processing.csv")
 
 
 
@@ -158,11 +157,14 @@ rejectAcqData %>%
 ```{r addForeignVars, include=F}
 
 # CTPA Vars should be basically static unless the protocol names change
-ctpaVars <- openxlsx::read.xlsx("ctpa_varieties.xlsx")
+if (!file.exists("ctpa_varieties.csv")) {
+  generate_ctpa_vars() %>% write_csv("ctpa_varieties.csv")
+}
+ctpaVars <- read_csv("ctpa_varieties.csv")
 ctpaVars$acquisition_protocol <- stringr::str_squish(ctpaVars$acquisition_protocol)
 
 # CTPA WEDs should be updated intermittently
-ctpaWeds <- openxlsx::read.xlsx("ctpa_with_wed_20250917.xlsx") %>%
+ctpaWeds <- read_csv("ctpa_wed_data.csv") %>%
   select(study_instance_uid, scout_wed) %>%
   filter(., !duplicated(study_instance_uid)) %>%
   mutate(wed = scout_wed/10)
@@ -183,7 +185,6 @@ ctpaInjection <- read_csv("ctpa_injection_data.csv")
 ageBinning <- function(df) {
   age_bins = c(0, 18, 35, 50, 75, 200)
   df$age_bin <- cut(df$patient_age_decimal, age_bins)
-  
   
   return(df)
 }
@@ -211,7 +212,8 @@ weightBinningFine <- function(df) {
 
 
 rejectAcqData <- rejectAcqData %>%
-  filter(study_date < "2025-09-12")
+  filter(study_date > params$startDate) %>% 
+  filter(study_date < params$endDate)
 
 
 rejectAcqData <- rejectAcqData %>%
@@ -244,6 +246,7 @@ rejectStudyData <- left_join(rejectStudyData,ctpaInjection) %>%
 
 
 rejectStudyData <- rejectStudyData %>%
+  # Estimate weight from WED using a formula derived from local data, which is more complete than recorded weights
   mutate(patient_weight_est = 8.623*exp(0.0079*scout_wed)) %>%
   weightBinning %>%
   weightBinningFine
@@ -556,7 +559,7 @@ models_df %>% as_hux
 
 
 ```{r}
-rejectStudyData %>% openxlsx::write.xlsx("ctpaRepeatData.xlsx")
+rejectStudyData %>% write_csv("ctpaRepeatData.csv")
 ```
 
 
